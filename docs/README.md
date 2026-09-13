@@ -116,28 +116,57 @@ inaccessible" should call `Open` first.
 
 ## Proof of possession
 
+### Machine Identity proof profile
+
 - **contract** — `identityproof.Domain` is
   `Keppin.MachineIdentity.ProofOfPossession.v1`; it is the domain-separation
   prefix and must not change without a coordinated version bump across signers
   and verifiers.
 - **contract** — `identityproof.KeyAlgorithmECDSA256` is `ecdsa-p256`, the
   algorithm label for the ECDSA P-256 proof profile.
-- **verified** — `identityproof.Digest(challenge)` is
-  `SHA-256(Domain || 0x00 || challenge)`.
-- **verified** — `identityproof.Sign` signs the domain-separated digest through
-  `crypto.Signer` (so CNG/KSP-backed signers work without platform coupling) and
-  returns an ASN.1 (DER) ECDSA signature.
-- **verified** — `identityproof.Verify` accepts `*ecdsa.PublicKey` (a parsed
-  public reference from `publickey.Parse` works directly) and returns
-  `identityproof.ErrInvalidProof` on any mismatch, or a distinct error for an
-  unsupported public-key type.
+- **contract** — the intended Machine Identity key profile is ECDSA P-256, and
+  signatures from the intended ECDSA signer are ASN.1 (DER) ECDSA signatures.
 - **verified** — `Domain` and `KeyAlgorithmECDSA256` are locked byte-for-byte by
   `identityproof` tests.
 
+### `identityproof.Sign` / `Verify` API behavior
+
+- **verified** — `identityproof.Digest(challenge)` is
+  `SHA-256(Domain || 0x00 || challenge)`.
+- **verified** — `identityproof.Sign` operates on a caller-supplied
+  `crypto.Signer`: it hashes the challenge into the domain-separated digest and
+  passes `crypto.SHA256` to the signer, returning whatever signature format the
+  signer produces. The package does not itself guarantee that an arbitrary signer
+  supplied to `Sign` is P-256 ECDSA or that its output is DER. CNG/KSP-backed
+  signers work without platform coupling.
+- **verified** — `identityproof.Verify` verifies ECDSA signatures for a supplied
+  `*ecdsa.PublicKey` (a parsed public reference from `publickey.Parse` works
+  directly) and returns `identityproof.ErrInvalidProof` on any mismatch, or a
+  distinct error for an unsupported public-key type. `Verify` does not
+  independently enforce P-256; callers using the Machine Identity profile are
+  responsible for supplying profile-conforming key material, normally obtained
+  from this module's canonical Machine Identity flow.
+
+### Replay protection and challenge freshness
+
+- **caller responsibility** — proof of possession alone does **not** provide
+  replay protection. A protocol using these proofs should ensure, as appropriate
+  to its design, that challenges are fresh/unpredictable, that they expire, and
+  that an accepted challenge/nonce is not reused; that the proof is checked
+  against the intended enrolled/trusted public key; and that the challenge (or
+  the surrounding protocol) binds the proof to the intended
+  operation/session/context when replay across contexts would matter.
+- The fixed challenge strings in the examples and tests exist only to demonstrate
+  the primitive. Production protocols must not treat a reusable fixed challenge
+  as replay protection.
+
 ## Supported algorithm / profile
 
-- **contract** — ECDSA P-256 only. No other curve or algorithm is supported.
+- **contract** — the Machine Identity key profile is ECDSA P-256 only. No other
+  curve or algorithm is part of the Machine Identity contract.
 - **verified** — `publickey` rejects any key on a curve other than P-256.
+- `identityproof.Verify` does not independently enforce P-256; see
+  [Proof of possession](#proof-of-possession).
 
 ## Error / failure semantics
 
@@ -209,8 +238,11 @@ module's crypto.
 - **policy** — the identity key is non-exportable and machine-scoped; private key
   material is never returned by this module's API. The non-exportability and
   machine scope are enforced by the shared CNG dependency.
-- **verified** — `publickey` and `identityproof` operate on public material only;
-  the encoding and fingerprint contain no private-key material.
+- **verified** — `publickey` operates on public material only; the encoding and
+  fingerprint contain no private-key material. `identityproof` verification uses
+  public-key material, while `identityproof.Sign` exercises a private signing
+  capability through `crypto.Signer`; the package does not require or expose raw
+  private-key bytes.
 - **verified** — the key is ECDSA P-256 only; `publickey` rejects any other
   curve.
 - **policy** — the persisted key carries a least-privilege DACL; enforcement
