@@ -5,6 +5,10 @@ This document is the authoritative technical reference for
 behavior, labeling each claim by its nature so readers can distinguish what is
 guaranteed from what is incidental.
 
+This document describes v0.2.0. For the changes from v0.1.x, see
+[Upgrading from v0.1.x](#upgrading-from-v01x) and the
+[v0.2.0 release notes](release-notes-v0.2.0.md).
+
 ### Claim legend
 
 - **contract** — a compatibility/persisted contract that must not change without
@@ -54,9 +58,16 @@ This module deliberately does **not** own:
 | Package | Responsibility | Platform |
 | --- | --- | --- |
 | `identity` | Owns the persisted identity key name and profile naming contract. | Any |
-| `keystore` | Windows CNG/KSP key custody: create/open/delete and the missing-key contract. | Windows only |
+| `keystore` | Windows CNG/KSP key custody: create/open/delete and the not-found-or-not-accessible contract. | Windows only |
 | `publickey` | Canonical public-key encoding, parsing, and fingerprinting. | Any |
 | `identityproof` | Domain-separated proof-of-possession signing and verification. | Any |
+
+## Requirements
+
+- **platform** — Go 1.26.8 (see `go.mod`; required by the CNG dependency).
+- **verified** — dependency: [`github.com/keppin-oss/cng`](https://github.com/keppin-oss/cng)
+  v0.3.1 (`windowscng`), resolved from the public module; no `replace`
+  directive is used.
 
 ## Persisted identity key contract
 
@@ -78,14 +89,15 @@ This module deliberately does **not** own:
   persisted key or creates it (non-exportable, machine-scoped ECDSA P-256) if it
   does not yet exist.
 - **Open** — `keystore.Open()` opens the existing key only and never creates a
-  replacement. It fails if the key is absent (`ErrKeyNotFound`) or inaccessible.
+  replacement. It fails with `ErrKeyNotFound` when the key was not found **or is
+  not accessible** to the caller; the two cases are not distinguished.
 - **Delete** — `keystore.Delete()` removes the exact key by name, never by
   wildcard.
 
-The non-exportability, machine scope, Microsoft Software KSP, and
-least-privilege DACL of the key are the *intended profile* (policy), enforced by
-the shared CNG dependency; this module delegates those operations and does not
-re-implement them (verified by `keystore` tests).
+The non-exportability, machine scope, Microsoft Software KSP, and restrictive
+DACL of the key are the *intended profile* (policy), enforced by the shared CNG
+dependency; this module delegates those operations and does not re-implement
+them (verified by `keystore` tests).
 
 ### Load-or-create behavior note
 
@@ -95,8 +107,15 @@ does **not** provide a stronger guarantee that an existing key which fails to
 open for other reasons (for example, an inaccessible or incompatible key) is
 preserved rather than recreated. The underlying CNG dependency may attempt
 creation on an arbitrary open failure; that behavior is **not** a Machine
-Identity guarantee. Callers that must distinguish "absent" from "present but
-inaccessible" should call `Open` first.
+Identity guarantee. The creation does not request overwriting an existing key.
+
+`Open` cannot tell "absent" from "present but inaccessible" either: the
+Microsoft Software KSP can report a key that exists but whose DACL does not
+grant the caller as not found, and `Open` returns `ErrKeyNotFound` in both
+cases. Callers that must not risk acting on an inaccessible key should first
+check the caller's privileges and inspect the native status (see
+[Error / failure semantics](#error--failure-semantics)), and must never treat
+`ErrKeyNotFound` alone as permission to create a new identity.
 
 ## Public-key reference: canonical encoding and fingerprint
 
@@ -175,11 +194,22 @@ inaccessible" should call `Open` first.
 - `identityproof.ErrInvalidProof` — the signature does not verify against the
   given key/challenge; `Verify` also returns a distinct error for an unsupported
   public-key type.
-- `keystore.ErrKeyNotFound` — the persisted key does not exist (returned by
-  `Open` and by `Delete` on an already-absent key). Match with `errors.Is`.
+- `keystore.ErrKeyNotFound` — the persisted key was not found **or is not
+  accessible** (returned by `Open` and `Delete`, and by `LoadOrCreate` when the
+  failure carries the shared not-found error). It is **not** proof of absence
+  and must never, by itself, trigger a reset, regeneration or overwrite of the
+  identity key.
+- **verified** — match `ErrKeyNotFound` with `errors.Is`, not `==`: the returned
+  error also keeps the shared `windowscng.ErrKeyNotFound` and any native status,
+  reachable with `errors.As` and `*windowscng.NCryptError`. `errors.Unwrap`
+  does not traverse this error tree.
 - **verified** — other `keystore` errors (permission, corruption, incompatible
   key, unexpected failure) are passed through unchanged and are **never**
-  converted into not-found.
+  converted into not-found by `keystore`.
+- **platform** — a permission denial that the Microsoft Software KSP itself
+  reports as not found does arrive as `ErrKeyNotFound`.
+- **verified** — existing keys that fail security validation on open fail
+  closed: no signer is returned.
 
 ## Handle ownership / Close responsibility
 
@@ -204,8 +234,10 @@ inaccessible" should call `Open` first.
 
 - **verified** — `Delete` removes the exact persisted key name and never performs
   wildcard/prefix deletion.
-- **verified** — deleting an already-absent key returns `ErrKeyNotFound`, so
-  uninstall/reset callers can treat it as idempotent cleanup.
+- **verified** — if the key is not found or not accessible, `Delete` returns
+  `ErrKeyNotFound` and deletes nothing. That means only "this call deleted
+  nothing": it does **not** prove that the key is absent, so callers must not
+  treat it as proof of successful cleanup.
 - **contract** — deleting the key destroys the prior identity's proof
   capability; a later `LoadOrCreate` produces a new identity unless a
   higher-level migration/recovery protocol exists.
@@ -224,6 +256,58 @@ inaccessible" should call `Open` first.
 The examples use synthetic/non-sensitive data and only supported public APIs;
 they expose no private key material and contain no re-implementation of the
 module's crypto.
+
+`examples/machineidentity` operates on the real production key name. It is not
+a test or cleanup tool.
+
+## Native smoke tests
+
+`go test ./...` with the default build tags (no native tags in `GOFLAGS`) never
+touches real CNG keys. The native tests in `keystore/keystore_smoke_test.go`
+run only with the `keystore_smoke` build tag and create, use and delete real
+persisted machine-scoped keys.
+
+- **Key names.** Every run uses its own name, `Keppin.Test.MachineIdentity.`
+  followed by a 128-bit random suffix. A guard rejects the production key name
+  before any CNG call, and the tests never call the production
+  `LoadOrCreate`/`Open`/`Delete`.
+- **Machine.** Use a sacrificial, exclusive test VM: no production identity, no
+  concurrent runs, no other writer on the `Keppin.Test.` namespace. Run from an
+  elevated (Administrator) process or as LocalSystem.
+- **SKIP and FAIL.** Elevation is read from the process token before any CNG
+  call. Only a caller that is certainly not elevated is skipped; with
+  `KEPPIN_KEYSTORE_SMOKE_REQUIRED=1` it fails instead. Any unexpected error
+  fails the test, and no CNG error is ever turned into a SKIP; the only accepted
+  CNG errors are the expected `ErrKeyNotFound` outcomes of the pre-check, the
+  post-delete readback and the repeated delete. A SKIP is never a PASS: check
+  the output for the scenarios actually run.
+- **Ownership limit.** Before creating, a pre-check with `Open` must report
+  `ErrKeyNotFound`. If it opens a key, the test closes it and fails for
+  collision without signing, changing or deleting it. `ErrKeyNotFound` does not
+  prove absence, `LoadOrCreate` does not certify that it created the key, and a
+  key appearing between the pre-check and the creation is not excluded (TOCTOU).
+  The exclusive VM is what makes the key attributable to the run.
+- **Cleanup.** Signers are closed before deletion and Close/Delete errors are
+  reported. A reported Close error is not proof that the native handle was
+  released. A recovery delete that returns `ErrKeyNotFound` is reported as an
+  uncertain state, not as success, and a successful recovery delete does not
+  clear an earlier failure.
+- **Recovery after interruption.** If the process is killed and cleanup does not
+  run, keep the test output as evidence and restore or dispose of the VM. Do not
+  use wildcard deletion and never act on the production key name.
+
+A PASS of `go vet -tags keystore_smoke ./keystore` only checks the code
+statically; it is not a native validation.
+
+Only on a VM that meets the conditions above (PowerShell):
+
+```powershell
+$env:KEPPIN_KEYSTORE_SMOKE_REQUIRED = '1'
+go test -count=1 -v -tags keystore_smoke ./keystore -run '^TestSmoke(MachineIdentityKeyCustody|DeleteKeyLifecycle)$'
+```
+
+Both scenarios must run and PASS with zero SKIP. Do not retry automatically to
+turn a failure green.
 
 ## Caller responsibilities
 
@@ -245,8 +329,15 @@ module's crypto.
   private-key bytes.
 - **verified** — the key is ECDSA P-256 only; `publickey` rejects any other
   curve.
-- **policy** — the persisted key carries a least-privilege DACL; enforcement
-  lives in the shared CNG dependency, not in this module.
+- **policy** — the persisted key is created with a restrictive DACL (SYSTEM and
+  Administrators get `GENERIC_ALL`, LOCAL SERVICE gets read/open) with no access
+  requested for ordinary interactive or authenticated users; enforcement lives
+  in the shared CNG dependency, not in this module.
+- **policy** — every open re-validates the persisted key's export policy and
+  checks the DACL as implemented by the CNG dependency: the required principals
+  must be present and specific disallowed principals are rejected. This is
+  **not** an exclusive allow-list (additional entries are accepted) and does not
+  establish Windows effective access.
 - **verified** — the fingerprint is always the SHA-256 of the canonical
   encoding — never of an alternate encoding.
 - **verified** — proof-of-possession is domain-separated to prevent
@@ -266,9 +357,13 @@ module's crypto.
 - **`keystore.LoadOrCreate`/`Delete` fails with an access/permission error** —
   run from an elevated (Administrator) process; machine-scoped key creation and
   deletion require it.
-- **`keystore.Open` returns `ErrKeyNotFound`** — the key has not been created
-  yet, or was deleted; call `LoadOrCreate` first (or treat as idempotent cleanup
-  when using `Delete`).
+- **`keystore.Open` or `keystore.Delete` returns `ErrKeyNotFound`** — the key
+  was not found **or is not accessible** to this caller; the two look the same.
+  First check the caller's privileges (run from an elevated or otherwise
+  authorized process) and inspect the native status with `errors.As` and
+  `*windowscng.NCryptError`. Do **not** call `LoadOrCreate` or reset the
+  identity, and do not treat the error as successful cleanup, on this error
+  alone.
 - **"not supported on this platform"** — the persisted Machine Identity custody
   (`keystore`) is Windows-only; run key custody on Windows. The
   `publickey`/`identityproof` primitives are platform-independent.
@@ -276,3 +371,24 @@ module's crypto.
   not match; ensure the signature was produced by `identityproof.Sign` for the
   exact challenge and that the public key is the signer's own (parsed via
   `publickey.Parse`).
+
+## Upgrading from v0.1.x
+
+- **`ErrKeyNotFound` means "not found or not accessible".** Its text is now
+  `keystore: machine identity key not found or not accessible`. Code that
+  treated it as proof that the key is absent (for example to call
+  `LoadOrCreate`, to regenerate the identity, or to report successful cleanup
+  after `Delete`) must be changed: check the caller's privileges and the native
+  status instead.
+- **Match with `errors.Is`, not `==`.** The returned error now wraps both
+  `keystore.ErrKeyNotFound` and the original shared error, so a direct
+  comparison `err == keystore.ErrKeyNotFound` no longer holds and
+  `errors.Unwrap` returns nil. Use `errors.Is(err, keystore.ErrKeyNotFound)`;
+  use `errors.As` with `*windowscng.NCryptError` to read the native status.
+- **`Delete` is no longer described as idempotent.** `ErrKeyNotFound` from
+  `Delete` means only that the call deleted nothing.
+- **CNG dependency v0.3.1.** `github.com/keppin-oss/cng` moves from v0.1.1 to
+  v0.3.1. The newer dependency rejects malformed security descriptors and
+  export-policy values that the older one accepted (fail closed). Go stays at
+  1.26.8.
+- No exported identifier was added or removed.

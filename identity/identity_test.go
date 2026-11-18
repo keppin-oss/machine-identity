@@ -17,10 +17,15 @@ func TestExactCurrentValues(t *testing.T) {
 	})
 }
 
-// TestNoWonderWandNamespace asserts the production machine identity does not
-// use the inherited WonderWand namespace.
-func TestNoWonderWandNamespace(t *testing.T) {
-	if strings.Contains(ProdMachineIdentityKeyName, "WonderWand") {
-		t.Fatalf("ProdMachineIdentityKeyName = %q must not contain the WonderWand namespace", ProdMachineIdentityKeyName)
+// TestProdKeyNameUsesKeppinAgentNamespace asserts the production machine
+// identity key lives in the Keppin Agent key namespace and carries an explicit
+// version suffix.
+func TestProdKeyNameUsesKeppinAgentNamespace(t *testing.T) {
+	const namespace = "Keppin.Agent."
+	if !strings.HasPrefix(ProdMachineIdentityKeyName, namespace) {
+		t.Fatalf("ProdMachineIdentityKeyName = %q must be in the %q namespace", ProdMachineIdentityKeyName, namespace)
+	}
+	if !strings.HasSuffix(ProdMachineIdentityKeyName, ".v1") {
+		t.Fatalf("ProdMachineIdentityKeyName = %q must carry the .v1 version suffix", ProdMachineIdentityKeyName)
 	}
 }

@@ -4,21 +4,24 @@
 // Identity key.
 //
 // The machine identity key is a non-exportable, machine-scoped ECDSA P-256 key
-// persisted in the Microsoft Software Key Storage Provider, protected by a
-// least-privilege DACL, and exposed to callers through crypto.Signer so the
+// persisted in the Microsoft Software Key Storage Provider, created with a
+// restrictive DACL, and exposed to callers through crypto.Signer so the
 // identityproof primitives can consume it without Windows-specific coupling.
 //
 // The native Windows CNG/KSP operations (open, create-or-open, delete, machine
-// scope, non-exportability, DACL enforcement, and CNG handle lifecycle) are
-// supplied by the shared github.com/keppin-oss/cng/windowscng
-// package. This package owns only the Machine Identity policy: the production
-// key name and the decision to create/open/delete it, the missing-key contract,
+// scope, non-exportability, DACL provisioning and validation, and CNG handle
+// lifecycle) are supplied by the shared github.com/keppin-oss/cng/windowscng
+// package. Its DACL validation checks that the required principals are present
+// and rejects specific disallowed ones; it is not an exclusive allow-list and
+// does not establish Windows effective access. This package owns only the Machine Identity policy: the production
+// key name and the decision to create/open/delete it, the not-found-or-not-accessible contract,
 // and the public Machine Identity API.
 package keystore
 
 import (
 	"crypto"
 	"errors"
+	"fmt"
 
 	"github.com/keppin-oss/cng/windowscng"
 	"github.com/keppin-oss/machine-identity/identity"
@@ -29,12 +32,18 @@ import (
 // the CNG module.
 const machineIdentityKeyName = identity.ProdMachineIdentityKeyName
 
-// ErrKeyNotFound is returned by Delete (and Open) when the persisted Machine
-// Identity key does not exist. It is a sentinel so uninstall/reset callers can
-// treat an already-absent key as success (idempotent cleanup). It is the
-// Machine Identity contract: callers must not need to know windowscng's
-// sentinel.
-var ErrKeyNotFound = errors.New("keystore: machine identity key not found")
+// ErrKeyNotFound is returned by Delete and Open (and by LoadOrCreate, when the
+// failure carries the shared sentinel) when the persisted Machine Identity key
+// was not found OR is not accessible to the caller. The Microsoft Software KSP
+// can report a key that exists but whose DACL does not grant the caller as
+// not found, so this error does NOT prove that the key is absent.
+//
+// Callers must never use it, by itself, to reset, regenerate, overwrite or
+// replace the identity key, nor to conclude that cleanup succeeded. For Delete
+// it means only that this call deleted nothing. Classify it with errors.Is:
+// the returned error also keeps the shared windowscng error and any native
+// cause (errors.As with *windowscng.NCryptError) in its tree.
+var ErrKeyNotFound = errors.New("keystore: machine identity key not found or not accessible")
 
 // LoadOrCreate opens the existing persisted Machine Identity key or creates it
 // (non-exportable, machine-scoped ECDSA P-256) if it does not yet exist.
@@ -43,7 +52,9 @@ func LoadOrCreate() (crypto.Signer, error) {
 }
 
 // Open opens the existing persisted Machine Identity key only and never silently
-// creates a replacement. It fails if the key does not exist or is inaccessible.
+// creates a replacement. It fails with ErrKeyNotFound if the key was not found
+// or is not accessible (the two are not distinguished), and with another error
+// for other failures.
 func Open() (crypto.Signer, error) {
 	return openKey(machineIdentityKeyName)
 }
@@ -55,8 +66,10 @@ func Open() (crypto.Signer, error) {
 // identity created through LoadOrCreate is a new identity unless a higher-level
 // migration/recovery protocol exists.
 //
-// Delete never creates a key. It returns ErrKeyNotFound if the key is already
-// absent, allowing idempotent uninstall/reset cleanup.
+// Delete never creates a key. It returns ErrKeyNotFound when the key was not
+// found or is not accessible, and deletes nothing in that case. That means
+// "nothing was deleted by this call"; it does not prove the key is absent, so
+// callers must not treat it as successful or idempotent cleanup on its own.
 func Delete() error {
 	return deleteKey(machineIdentityKeyName)
 }
@@ -88,13 +101,23 @@ func deleteKey(name string) error {
 	return mapCNGError(windowscng.Delete(name))
 }
 
-// mapCNGError translates the shared windowscng missing-key sentinel into the
-// Machine Identity ErrKeyNotFound contract. Other errors (permission,
-// corruption, incompatible-key, unexpected failures) are passed through
-// unchanged and are never converted into not-found.
+// mapCNGError translates the shared windowscng not-found-or-not-accessible
+// sentinel into the Machine Identity ErrKeyNotFound contract while keeping the original error in
+// the error tree. The result matches both ErrKeyNotFound and, through
+// errors.Is, windowscng.ErrKeyNotFound, and any native cause the shared layer
+// attached (for example *windowscng.NCryptError, reachable with errors.As) is
+// preserved. Callers must classify the result with errors.Is and errors.As:
+// errors.Unwrap does not traverse the multi-error tree and a direct comparison
+// with ErrKeyNotFound no longer holds.
+//
+// The sentinel means "not found or not accessible", not proof of absence.
+// Other errors (permission, corruption, incompatible-key, unexpected failures)
+// are passed through unchanged and are never converted into not-found, and a
+// nil error stays nil. The native code is not re-classified here: only an
+// error that already carries the windowscng sentinel is mapped.
 func mapCNGError(err error) error {
 	if errors.Is(err, windowscng.ErrKeyNotFound) {
-		return ErrKeyNotFound
+		return fmt.Errorf("%w: %w", ErrKeyNotFound, err)
 	}
 	return err
 }

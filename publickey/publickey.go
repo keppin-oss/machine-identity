@@ -4,9 +4,8 @@
 //
 // It is the single authoritative contract for serializing, parsing and
 // fingerprinting a Machine Identity public key, shared by Agent-side production
-// and Server-side verification. Consumers such as Keppin-Suite must not define
-// their own encoding, parsing or fingerprinting of the Machine Identity public
-// key.
+// and Server-side verification. Consumers must not define their own encoding,
+// parsing or fingerprinting of the Machine Identity public key.
 //
 // The package operates on public material only, is platform-independent, and
 // introduces no Windows dependency. Key custody remains in the CNG module and
