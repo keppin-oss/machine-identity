@@ -100,6 +100,11 @@ The full technical specification — contracts, key custody lifecycle, encoding 
 fingerprint rules, proof-of-possession semantics, error handling, and security
 invariants — lives in [docs/README.md](docs/README.md).
 
+**v0.2.0** redefines `keystore.ErrKeyNotFound` as "not found or not accessible"
+and moves to `github.com/keppin-oss/cng` v0.3.1. See the
+[v0.2.0 release notes](docs/release-notes-v0.2.0.md) and
+[Upgrading from v0.1.x](docs/README.md#upgrading-from-v01x).
+
 ## License
 
 Apache License 2.0. See [LICENSE](LICENSE).
