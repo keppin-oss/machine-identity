@@ -5,7 +5,9 @@ This document is the authoritative technical reference for
 behavior, labeling each claim by its nature so readers can distinguish what is
 guaranteed from what is incidental.
 
-This document describes v0.2.0. For the changes from v0.1.x, see
+This document describes v0.3.0. For the changes from v0.2.0, see
+[Upgrading from v0.2.0](#upgrading-from-v020) and the
+[v0.3.0 release notes](release-notes-v0.3.0.md); for the changes from v0.1.x, see
 [Upgrading from v0.1.x](#upgrading-from-v01x) and the
 [v0.2.0 release notes](release-notes-v0.2.0.md).
 
@@ -27,8 +29,8 @@ The module solves one problem: giving a Windows machine a stable, durable
 identity it can prove it holds. It owns four things:
 
 - the persisted **identity key name** (a compatibility contract),
-- the **key custody** for that key (create/open/delete in the Windows Microsoft
-  Software Key Storage Provider),
+- the **key custody** for that key (separate open, create and delete in the
+  Windows Microsoft Software Key Storage Provider),
 - the **canonical public-key reference** (uncompressed P-256 point encoding and
   its stable SHA-256 fingerprint),
 - the **proof-of-possession** primitive (domain-separated challenge signing and
@@ -58,7 +60,7 @@ This module deliberately does **not** own:
 | Package | Responsibility | Platform |
 | --- | --- | --- |
 | `identity` | Owns the persisted identity key name and profile naming contract. | Any |
-| `keystore` | Windows CNG/KSP key custody: create/open/delete and the not-found-or-not-accessible contract. | Windows only |
+| `keystore` | Windows CNG/KSP key custody: separate open, create and delete under a service policy, the SubjectPublicKeyInfo helper and the error contract. | Windows only |
 | `publickey` | Canonical public-key encoding, parsing, and fingerprinting. | Any |
 | `identityproof` | Domain-separated proof-of-possession signing and verification. | Any |
 
@@ -66,7 +68,7 @@ This module deliberately does **not** own:
 
 - **platform** — Go 1.26.8 (see `go.mod`; required by the CNG dependency).
 - **verified** — dependency: [`github.com/keppin-oss/cng`](https://github.com/keppin-oss/cng)
-  v0.3.1 (`windowscng`), resolved from the public module; no `replace`
+  v0.5.1 (`windowscng`), resolved from the public module; no `replace`
   directive is used.
 
 ## Persisted identity key contract
@@ -78,44 +80,68 @@ This module deliberately does **not** own:
   without an explicit migration/cleanup procedure; changing it would create a
   parallel identity.
 - **verified** — the value is locked byte-for-byte by `identity` tests, and the
-  `keystore` package tests assert that `Delete` targets exactly this name.
+  `keystore` package tests assert that the keystore operates on exactly this
+  name.
 
 ## Key custody lifecycle
 
-`keystore` exposes the machine identity key through `crypto.Signer`, so
-`identityproof` can consume it without Windows-specific coupling.
+`keystore` exposes the machine identity key through `windowscng.Signer`, a
+`crypto.Signer` with `Close`, so `identityproof` can consume it without
+Windows-specific coupling. Opening, creating and deleting are separate
+operations; none performs another as a side effect.
 
-- **Create / load-or-create** — `keystore.LoadOrCreate()` opens the existing
-  persisted key or creates it (non-exportable, machine-scoped ECDSA P-256) if it
-  does not yet exist.
-- **Open** — `keystore.Open()` opens the existing key only and never creates a
-  replacement. It fails with `ErrKeyNotFound` when the key was not found **or is
-  not accessible** to the caller; the two cases are not distinguished.
-- **Delete** — `keystore.Delete()` removes the exact key by name, never by
-  wildcard.
+- **Policy** — every operation takes a `windowscng.ServicePolicy`, built by
+  the caller with `windowscng.NewServicePolicy(serviceName)` from the name of
+  the Windows service that uses the key. Its protected DACL grants SYSTEM and
+  Administrators `GENERIC_ALL` and that service's own SID (`NT SERVICE\<name>`)
+  read and execute. The service must run with its service SID enabled in its
+  token (`sc.exe sidtype <name> unrestricted`, or `restricted`). This module
+  does not choose or embed the service name.
+- **Open** — `keystore.Open(policy)` opens the existing key only and never
+  creates, modifies or deletes a key. It fails with `ErrKeyNotFound` when the
+  key was not found **or is not accessible** to the caller (the two cases are
+  not distinguished), and with `ErrKeyPolicyMismatch` when the key is not
+  exactly in the policy state.
+- **Create** — `keystore.Create(policy)` creates a new non-exportable,
+  machine-scoped ECDSA P-256 key and never opens, adopts, modifies or deletes an
+  existing one: a key already persisted under the name returns `ErrKeyExists`.
+  It requires an elevated (Administrator) process or LocalSystem.
+- **Identity** — `keystore.SPKI(signer.Public())` returns the DER
+  SubjectPublicKeyInfo of the key (`x509.MarshalPKIXPublicKey`, ECDSA P-256
+  only). The caller records it durably right after `Create` and before using
+  the key.
+- **Delete** — `keystore.Delete(policy, expectedSPKI)` deletes the exact key
+  only after the shared CNG dependency has verified, on the handle it then
+  deletes, the policy and that the key's SubjectPublicKeyInfo is
+  `expectedSPKI`. It requires an elevated process or LocalSystem.
 
-The non-exportability, machine scope, Microsoft Software KSP, and restrictive
-DACL of the key are the *intended profile* (policy), enforced by the shared CNG
+The non-exportability, machine scope, Microsoft Software KSP and the exact DACL
+of the key are the *intended profile* (policy), enforced by the shared CNG
 dependency; this module delegates those operations and does not re-implement
 them (verified by `keystore` tests).
 
-### Load-or-create behavior note
+### Creating is an explicit decision
 
-`LoadOrCreate` is documented at the load-or-create contract level only: it
-returns the persisted key, creating it when it does not yet exist. This module
-does **not** provide a stronger guarantee that an existing key which fails to
-open for other reasons (for example, an inaccessible or incompatible key) is
-preserved rather than recreated. The underlying CNG dependency may attempt
-creation on an arbitrary open failure; that behavior is **not** a Machine
-Identity guarantee. The creation does not request overwriting an existing key.
-
-`Open` cannot tell "absent" from "present but inaccessible" either: the
-Microsoft Software KSP can report a key that exists but whose DACL does not
-grant the caller as not found, and `Open` returns `ErrKeyNotFound` in both
-cases. Callers that must not risk acting on an inaccessible key should first
-check the caller's privileges and inspect the native status (see
-[Error / failure semantics](#error--failure-semantics)), and must never treat
-`ErrKeyNotFound` alone as permission to create a new identity.
+- **caller responsibility** — a failed open is never a reason to create a key.
+  `ErrKeyNotFound` does not prove that the key is absent: the Microsoft Software
+  KSP can report a key that exists but whose DACL does not grant the caller as
+  not found. `ErrKeyPolicyMismatch` means a key exists in another state. Neither
+  outcome authorizes `Create`; creation belongs to an authorized first
+  installation or recovery flow owned by the caller.
+- **caller responsibility** — `Create` does not reserve the key name:
+  `ErrKeyExists` covers only a key already persisted, and two overlapping
+  creates can both succeed with different keys. The caller serializes every
+  lifecycle operation on the key (create, delete, recovery), also across
+  processes, from before the create until the new key's SubjectPublicKeyInfo
+  is recorded.
+- **caller responsibility** — compare the recorded SubjectPublicKeyInfo with
+  the opened key's at every later open; a difference is a conflict to report,
+  never a key to adopt or to delete by name.
+- **verified** — when the key created by `Create` fails its post-create checks,
+  the shared layer deletes it through the same handle; if that delete fails too,
+  the error also matches `windowscng.ErrCleanupFailed` and the key may persist.
+  No signer is returned on any error, and the caller must not delete the key by
+  name.
 
 ## Public-key reference: canonical encoding and fingerprint
 
@@ -195,52 +221,85 @@ check the caller's privileges and inspect the native status (see
   given key/challenge; `Verify` also returns a distinct error for an unsupported
   public-key type.
 - `keystore.ErrKeyNotFound` — the persisted key was not found **or is not
-  accessible** (returned by `Open` and `Delete`, and by `LoadOrCreate` when the
-  failure carries the shared not-found error). It is **not** proof of absence
-  and must never, by itself, trigger a reset, regeneration or overwrite of the
-  identity key.
-- **verified** — match `ErrKeyNotFound` with `errors.Is`, not `==`: the returned
-  error also keeps the shared `windowscng.ErrKeyNotFound` and any native status,
-  reachable with `errors.As` and `*windowscng.NCryptError`. `errors.Unwrap`
-  does not traverse this error tree.
-- **verified** — other `keystore` errors (permission, corruption, incompatible
-  key, unexpected failure) are passed through unchanged and are **never**
-  converted into not-found by `keystore`.
+  accessible** (`Open`, `Delete`). It is **not** proof of absence and must
+  never, by itself, trigger a create, reset, regeneration or overwrite of the
+  identity key. From `Delete` it means only that the call deleted nothing.
+- `keystore.ErrKeyExists` — `Create` found a key already persisted under the
+  name; the existing key was not opened, adopted, modified or deleted.
+- `keystore.ErrKeyPolicyMismatch` — the key exists but its DACL is not exactly
+  the requested policy, or its public key is not a valid ECDSA P-256 key. Open
+  never modifies the key.
+- `keystore.ErrPrivilegeRequired` — `Create` or `Delete` was called by a process
+  that is not elevated (Administrators) or LocalSystem, or the privilege could
+  not be established; nothing was opened, created or deleted.
+- `keystore.ErrDeleteVerificationFailed` — `Delete` opened the key but a check
+  on that handle did not pass or could not be completed (export policy, curve,
+  DACL or SubjectPublicKeyInfo); nothing was deleted. It does not prove that
+  the key belongs to someone else. It takes precedence over a policy mismatch:
+  the result then matches `windowscng.ErrPolicyMismatch` but not
+  `keystore.ErrKeyPolicyMismatch`.
+- **verified** — match every sentinel with `errors.Is`, not `==`: the returned
+  error also keeps the shared `windowscng` error and, when it carries one, the
+  native status, reachable with `errors.As` and `*windowscng.NCryptError`.
+  `errors.Unwrap` does not traverse this error tree.
+- **verified** — an error that matches none of the shared sentinels above
+  (invalid input such as an empty or malformed SubjectPublicKeyInfo or the zero
+  `ServicePolicy`, a failure of the native delete itself, a create rollback
+  failure `windowscng.ErrCleanupFailed` on its own, other unexpected failures)
+  is returned unchanged and is **never** converted into not-found or into a
+  failed verification.
 - **platform** — a permission denial that the Microsoft Software KSP itself
   reports as not found does arrive as `ErrKeyNotFound`.
-- **verified** — existing keys that fail security validation on open fail
-  closed: no signer is returned.
+- **verified** — existing keys that fail the exact policy validation on open
+  fail closed: no signer is returned.
 
 ## Handle ownership / Close responsibility
 
-- **caller responsibility** — the `crypto.Signer` returned by `keystore` owns the
-  underlying CNG provider and key handles. To release them, type-assert to
-  `windowscng.Signer` and call `Close`:
+- **caller responsibility** — the `windowscng.Signer` returned by `Open` and
+  `Create` owns the underlying CNG provider and key handles. Release them with
+  `Close` when done; the persisted key stays:
 
   ```go
-  signer.(windowscng.Signer).Close()
+  defer signer.Close()
   ```
 
+  Code that only signs can receive the signer as a `crypto.Signer`.
 - **caller responsibility** — close a signer before deleting the key it
-  represents.
+  represents. Signers opened before a change keep the access they were opened
+  with until they are closed.
 
 ## Windows elevation requirements
 
-- **platform** — creating or deleting the machine-scoped key requires an
-  elevated (Administrator) process. Opening an existing key and signing does not
-  require elevation for principals granted access by the key's DACL.
+- **platform** — `Create` and `Delete` require an elevated (Administrator)
+  process or LocalSystem, whatever the policy; otherwise they return
+  `ErrPrivilegeRequired`. Invalid input is rejected before that check.
+- **platform** — `Open` under a `ServicePolicy` does not require elevation, but
+  that does not guarantee access: the caller's token must be granted by the key
+  DACL (SYSTEM, Administrators, or the service SID of the policy).
 
 ## Delete semantics
 
 - **verified** — `Delete` removes the exact persisted key name and never performs
   wildcard/prefix deletion.
+- **verified** — `Delete` deletes only after the shared CNG dependency has
+  verified, on the handle it then deletes, the export policy, the curve, the
+  exact DACL of the policy and that the key's SubjectPublicKeyInfo is
+  byte-for-byte `expectedSPKI`. Otherwise it returns
+  `ErrDeleteVerificationFailed` and deletes nothing.
+- **caller responsibility** — `expectedSPKI` is the value recorded after
+  `Create` (see `keystore.SPKI`), never one derived by opening the key just
+  before the delete. A key whose SubjectPublicKeyInfo was never recorded cannot
+  be deleted through this module.
+- **verified** — the SubjectPublicKeyInfo is the DER PKIX encoding, not the
+  canonical 65-byte reference of `publickey.Encode`: the two are not
+  interchangeable.
 - **verified** — if the key is not found or not accessible, `Delete` returns
   `ErrKeyNotFound` and deletes nothing. That means only "this call deleted
   nothing": it does **not** prove that the key is absent, so callers must not
   treat it as proof of successful cleanup.
 - **contract** — deleting the key destroys the prior identity's proof
-  capability; a later `LoadOrCreate` produces a new identity unless a
-  higher-level migration/recovery protocol exists.
+  capability; a key created afterwards is a new identity unless a higher-level
+  migration/recovery protocol exists.
 
 ## Examples
 
@@ -249,9 +308,13 @@ check the caller's privileges and inspect the native status (see
   proof-of-possession using a synthetic in-memory P-256 key. Use this to learn
   the reference and proof contract without Windows/elevation.
 - [`examples/machineidentity`](../examples/machineidentity) — Windows only; the
-  full realistic flow: `LoadOrCreate`, encode/fingerprint the public reference,
-  sign a challenge, verify it, `Open` the existing key, and close signers.
-  Requires an elevated process for first creation.
+  realistic flow under the `ServicePolicy` of `-service <name>`: `Open` the
+  existing key, encode/fingerprint the public reference, sign a challenge,
+  verify it, and close the signer. It never creates a key unless run with
+  `-create`, which requires an elevated process, fails if a key exists, and
+  prints the new key's SubjectPublicKeyInfo (DER, base64) right after the
+  create. That output is not a durable record. The example never deletes the
+  key.
 
 The examples use synthetic/non-sensitive data and only supported public APIs;
 they expose no private key material and contain no re-implementation of the
@@ -267,10 +330,11 @@ touches real CNG keys. The native tests in `keystore/keystore_smoke_test.go`
 run only with the `keystore_smoke` build tag and create, use and delete real
 persisted machine-scoped keys.
 
-- **Key names.** Every run uses its own name, `Keppin.Test.MachineIdentity.`
-  followed by a 128-bit random suffix. A guard rejects the production key name
-  before any CNG call, and the tests never call the production
-  `LoadOrCreate`/`Open`/`Delete`.
+- **Key names and policy.** Every run uses its own name,
+  `Keppin.Test.MachineIdentity.` followed by a 128-bit random suffix, and the
+  `ServicePolicy` of a test service name that does not need to exist. A guard
+  rejects the production key name before any CNG call, and the tests never call
+  the production `Open`/`Create`/`Delete`.
 - **Machine.** Use a sacrificial, exclusive test VM: no production identity, no
   concurrent runs, no other writer on the `Keppin.Test.` namespace. Run from an
   elevated (Administrator) process or as LocalSystem.
@@ -278,41 +342,62 @@ persisted machine-scoped keys.
   call. Only a caller that is certainly not elevated is skipped; with
   `KEPPIN_KEYSTORE_SMOKE_REQUIRED=1` it fails instead. Any unexpected error
   fails the test, and no CNG error is ever turned into a SKIP; the only accepted
-  CNG errors are the expected `ErrKeyNotFound` outcomes of the pre-check, the
-  post-delete readback and the repeated delete. A SKIP is never a PASS: check
-  the output for the scenarios actually run.
-- **Ownership limit.** Before creating, a pre-check with `Open` must report
-  `ErrKeyNotFound`. If it opens a key, the test closes it and fails for
-  collision without signing, changing or deleting it. `ErrKeyNotFound` does not
-  prove absence, `LoadOrCreate` does not certify that it created the key, and a
-  key appearing between the pre-check and the creation is not excluded (TOCTOU).
-  The exclusive VM is what makes the key attributable to the run.
+  errors are the outcomes each scenario expects (`ErrKeyNotFound` after a
+  delete, `ErrKeyExists` for a second create, `ErrDeleteVerificationFailed` for
+  another key's SubjectPublicKeyInfo, `ErrKeyPolicyMismatch` for another
+  service's policy). A SKIP is never a PASS: check the output for the scenarios
+  actually run.
+- **Scenarios.** Custody (create, sign/verify, reopen the same key, delete,
+  readback); the delete lifecycle twice on one name, with a repeated delete
+  using the SubjectPublicKeyInfo of the same iteration; a second create refused
+  with `ErrKeyExists`; a delete with the SubjectPublicKeyInfo of another valid
+  P-256 key refused; an open under another service's policy refused. After each
+  refusal the key is reopened and its SubjectPublicKeyInfo compared with the
+  recorded one.
+- **Ownership limit.** Keys are created with `Create`, which never adopts an
+  existing key: a collision fails the test without signing, changing or
+  deleting that key. `Create` does not reserve the name; the exclusive VM is
+  what makes the key attributable to the run.
+- **Identity.** The SubjectPublicKeyInfo of every created key is recorded from
+  the signer `Create` returns, and every cleanup delete uses it, never one read
+  by opening the key. The only delete with another value is the negative
+  scenario, which uses another key's SubjectPublicKeyInfo on purpose. If a create fails with an uncertain rollback
+  (`windowscng.ErrCleanupFailed`) or the value cannot be recorded, the test
+  fails naming the key and its uncertain state and deletes nothing by name.
 - **Cleanup.** Signers are closed before deletion and Close/Delete errors are
   reported. A reported Close error is not proof that the native handle was
   released. A recovery delete that returns `ErrKeyNotFound` is reported as an
   uncertain state, not as success, and a successful recovery delete does not
-  clear an earlier failure.
+  clear an earlier failure. This is fixture cleanup, not product recovery.
 - **Recovery after interruption.** If the process is killed and cleanup does not
   run, keep the test output as evidence and restore or dispose of the VM. Do not
   use wildcard deletion and never act on the production key name.
 
-A PASS of `go vet -tags keystore_smoke ./keystore` only checks the code
-statically; it is not a native validation.
+`go vet -tags keystore_smoke ./keystore` analyzes the tagged code statically;
+`go test -c -tags keystore_smoke ./keystore` compiles **and links** the smoke
+test binary. Neither runs the smoke tests, so a PASS of either is not a native
+validation.
 
 Only on a VM that meets the conditions above (PowerShell):
 
 ```powershell
 $env:KEPPIN_KEYSTORE_SMOKE_REQUIRED = '1'
-go test -count=1 -v -tags keystore_smoke ./keystore -run '^TestSmoke(MachineIdentityKeyCustody|DeleteKeyLifecycle)$'
+go test -count=1 -v -tags keystore_smoke ./keystore -run '^TestSmoke(MachineIdentityKeyCustody|DeleteKeyLifecycle|CreateExistingKeyNotAdopted|DeleteWrongSPKIRefused|OpenOtherPolicyMismatch)$'
 ```
 
-Both scenarios must run and PASS with zero SKIP. Do not retry automatically to
-turn a failure green.
+All five scenarios must run and PASS with zero SKIP. Do not retry
+automatically to turn a failure green.
 
 ## Caller responsibilities
 
 - Treat the identity name, canonical encoding, and fingerprint as contracts you
   must not alter.
+- Build the `ServicePolicy` from the name of the service that actually uses the
+  key, and run that service with its service SID enabled.
+- Create the key only in an authorized first installation or recovery flow,
+  never after a failed open; serialize every lifecycle operation on the key.
+- Record the SubjectPublicKeyInfo returned for a created key durably, compare
+  it at every open, and pass it to `Delete`.
 - Run create/delete from an elevated context.
 - Close signers when done, and before delete.
 - Never ship or log private key material (the public reference contains none).
@@ -329,15 +414,17 @@ turn a failure green.
   private-key bytes.
 - **verified** — the key is ECDSA P-256 only; `publickey` rejects any other
   curve.
-- **policy** — the persisted key is created with a restrictive DACL (SYSTEM and
-  Administrators get `GENERIC_ALL`, LOCAL SERVICE gets read/open) with no access
-  requested for ordinary interactive or authenticated users; enforcement lives
-  in the shared CNG dependency, not in this module.
-- **policy** — every open re-validates the persisted key's export policy and
-  checks the DACL as implemented by the CNG dependency: the required principals
-  must be present and specific disallowed principals are rejected. This is
-  **not** an exclusive allow-list (additional entries are accepted) and does not
-  establish Windows effective access.
+- **policy** — the persisted key is created with the protected DACL of its
+  `ServicePolicy` (SYSTEM and Administrators get `GENERIC_ALL`, the one service
+  SID gets read/execute), with no access for LOCAL SERVICE as a whole or for
+  ordinary interactive or authenticated users; enforcement lives in the shared
+  CNG dependency, not in this module.
+- **policy** — every open and every delete re-validates the persisted key's
+  export policy, curve and DACL as implemented by the CNG dependency: the DACL
+  must be exactly the form of the requested policy (a protected DACL with
+  exactly the expected entries and masks; owner, group and SACL are not
+  checked). Any other DACL is rejected, never repaired. This does not establish
+  Windows effective access.
 - **verified** — the fingerprint is always the SHA-256 of the canonical
   encoding — never of an alternate encoding.
 - **verified** — proof-of-possession is domain-separated to prevent
@@ -354,16 +441,27 @@ turn a failure green.
 
 ## Troubleshooting
 
-- **`keystore.LoadOrCreate`/`Delete` fails with an access/permission error** —
-  run from an elevated (Administrator) process; machine-scoped key creation and
-  deletion require it.
+- **`keystore.Create`/`Delete` returns `ErrPrivilegeRequired`** — run from an
+  elevated (Administrator) process or as LocalSystem; machine-scoped key
+  creation and deletion require it.
 - **`keystore.Open` or `keystore.Delete` returns `ErrKeyNotFound`** — the key
   was not found **or is not accessible** to this caller; the two look the same.
-  First check the caller's privileges (run from an elevated or otherwise
-  authorized process) and inspect the native status with `errors.As` and
-  `*windowscng.NCryptError`. Do **not** call `LoadOrCreate` or reset the
-  identity, and do not treat the error as successful cleanup, on this error
-  alone.
+  First check the caller's privileges and that the service runs with its
+  service SID enabled, and inspect the native status with `errors.As` and
+  `*windowscng.NCryptError`. Do **not** call `Create` or reset the identity, and
+  do not treat the error as successful cleanup, on this error alone.
+- **`keystore.Open` returns `ErrKeyPolicyMismatch`** — the key exists but its
+  DACL is not exactly the requested `ServicePolicy`: for example a key created
+  by v0.2.0 or earlier with the LOCAL SERVICE DACL, a policy built for another
+  service name, or a DACL changed by hand. The key was not modified. Do not
+  create, delete or adopt it from this error; see
+  [Upgrading from v0.2.0](#upgrading-from-v020).
+- **`keystore.Create` returns `ErrKeyExists`** — a key is already persisted
+  under the name. It was not opened or changed. Open it, or follow an
+  authorized recovery flow; never delete it by name to make room.
+- **`keystore.Delete` returns `ErrDeleteVerificationFailed`** — the key is not
+  the recorded one (SubjectPublicKeyInfo), or not in the policy state. Nothing
+  was deleted.
 - **"not supported on this platform"** — the persisted Machine Identity custody
   (`keystore`) is Windows-only; run key custody on Windows. The
   `publickey`/`identityproof` primitives are platform-independent.
@@ -372,14 +470,56 @@ turn a failure green.
   exact challenge and that the public key is the signer's own (parsed via
   `publickey.Parse`).
 
+## Upgrading from v0.2.0
+
+v0.3.0 is a **breaking** release with no compatibility layer.
+
+- **CNG dependency v0.5.1.** `github.com/keppin-oss/cng` moves from v0.3.1 to
+  v0.5.1. Go stays at 1.26.8.
+- **Load-or-create is removed.** The v0.2.0 entry point that opened the key
+  and, after any failed open, attempted to create it is gone. Use `Open(policy)` for ordinary use
+  and `Create(policy)` only in an authorized first installation or recovery
+  flow. A key that cannot be opened is an error to handle, never a reason to
+  create one.
+- **Open, Create and Delete take a policy.** `Open()`, `Delete()` become
+  `Open(policy)`, `Delete(policy, expectedSPKI)`; `Create(policy)` is new. The
+  policy is a `windowscng.ServicePolicy` built from the name of the service that
+  uses the key; keys are created with its DACL instead of the v0.2.0 DACL that
+  granted LOCAL SERVICE as a whole.
+- **Delete needs the recorded identity.** `Delete` requires the key's DER
+  SubjectPublicKeyInfo recorded after `Create` (`keystore.SPKI`, new), and
+  deletes only after verifying it on the handle it deletes.
+- **Signers are `windowscng.Signer`.** `Open` and `Create` return
+  `windowscng.Signer`; call `Close` directly instead of type-asserting a
+  `crypto.Signer`.
+- **New sentinels.** `ErrKeyExists`, `ErrKeyPolicyMismatch`,
+  `ErrPrivilegeRequired` and `ErrDeleteVerificationFailed`, each wrapping the
+  shared `windowscng` error. `ErrKeyNotFound` is unchanged.
+- **Exact DACL validation.** The tolerant check of v0.2.0 is gone: `Open` and
+  `Delete` accept only the exact DACL of the policy.
+- **Existing keys do not open.** A key created by v0.2.0 or earlier carries the
+  LOCAL SERVICE DACL, which is not a `ServicePolicy`: `Open(policy)` returns
+  `ErrKeyPolicyMismatch`, or `ErrKeyNotFound` if the caller cannot open it at
+  all. `Delete` refuses it with `ErrDeleteVerificationFailed` even with the
+  right SubjectPublicKeyInfo, because its DACL is not the exact form of the
+  policy; without a recorded SubjectPublicKeyInfo it cannot be deleted at all.
+  This release provides no migration path for those keys. Before rolling out
+  to existing installations, stop at this condition explicitly: do not create,
+  delete, adopt or re-permission the key from this module's errors.
+
 ## Upgrading from v0.1.x
+
+This section describes only the move from v0.1.x to v0.2.0 (see the
+[v0.2.0 release notes](release-notes-v0.2.0.md)). The API it refers to is the
+v0.2.0 one; for v0.3.0, continue with
+[Upgrading from v0.2.0](#upgrading-from-v020).
 
 - **`ErrKeyNotFound` means "not found or not accessible".** Its text is now
   `keystore: machine identity key not found or not accessible`. Code that
-  treated it as proof that the key is absent (for example to call
-  `LoadOrCreate`, to regenerate the identity, or to report successful cleanup
-  after `Delete`) must be changed: check the caller's privileges and the native
-  status instead.
+  treated it as proof that the key is absent (for example to create a new
+  key, to regenerate the identity, or to report successful cleanup after a
+  delete) must be changed: check the caller's privileges and the native status
+  instead.
 - **Match with `errors.Is`, not `==`.** The returned error now wraps both
   `keystore.ErrKeyNotFound` and the original shared error, so a direct
   comparison `err == keystore.ErrKeyNotFound` no longer holds and
@@ -391,4 +531,4 @@ turn a failure green.
   v0.3.1. The newer dependency rejects malformed security descriptors and
   export-policy values that the older one accepted (fail closed). Go stays at
   1.26.8.
-- No exported identifier was added or removed.
+- v0.2.0 added or removed no exported identifier.

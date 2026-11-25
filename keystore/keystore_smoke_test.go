@@ -7,8 +7,9 @@ package keystore
 // These tests create, use and delete REAL persisted machine-scoped CNG keys.
 // They never touch the production Machine Identity key: every test key name is
 // generated per run and checked against machineIdentityKeyName before any CNG
-// operation. The production LoadOrCreate/Open/Delete entry points are not
-// called here.
+// operation. The production Open/Create/Delete entry points are not called
+// here; the tests use the same unexported helpers with a per-run name and a
+// ServicePolicy for a test service name that does not need to exist.
 //
 // Preconditions (see docs/README.md, "Native smoke tests"):
 //   - a sacrificial, exclusive test VM: no production identity, no concurrent
@@ -20,31 +21,39 @@ package keystore
 // the token is a FAIL. With KEPPIN_KEYSTORE_SMOKE_REQUIRED=1 a non-elevated
 // caller is a FAIL too. Every unexpected error (provider, DACL, export policy,
 // provisioning, rollback) is a FAIL, and no CNG error is ever turned into a
-// SKIP. The only CNG errors accepted are the expected ErrKeyNotFound outcomes
-// of the pre-check, the post-delete readback and the repeated delete.
+// SKIP. The only errors accepted are the expected outcomes each scenario
+// checks: ErrKeyNotFound after a delete, ErrKeyExists for a second create,
+// ErrDeleteVerificationFailed for a wrong SubjectPublicKeyInfo and
+// ErrKeyPolicyMismatch for another policy.
 //
 // Key ownership (operational isolation, not atomic exclusivity): the name gets
-// a 128-bit crypto/rand suffix, and a pre-check with Open must report
-// ErrKeyNotFound before the key is created. ErrKeyNotFound is not proof of
-// absence, LoadOrCreate does not certify that it created the key, and a key
-// appearing between the pre-check and LoadOrCreate is not excluded (TOCTOU).
-// The isolation preconditions above are what make the created key attributable
-// to this run. If the pre-check opens a key, the signer is closed and the test
-// fails for collision without signing, changing or deleting that key.
+// a 128-bit crypto/rand suffix and is created with Create, which never adopts
+// an existing key (ErrKeyExists, and the test fails without touching it). Create
+// does not reserve the name: the isolation preconditions above are what make
+// the created key attributable to this run.
 //
-// Cleanup: t.Cleanup is registered before the pre-check, so before any attempt
-// by the smoke to create a key (this does not prove that no key exists); every
-// signer is closed before deletion, and Close and Delete errors are reported. A Close error is reported, not proof that the native handle
-// was released, and a successful recovery delete does not clear an earlier
-// FAIL. A recovery delete
-// that returns ErrKeyNotFound is reported as an uncertain state, never as
-// successful cleanup. If the process is killed and t.Cleanup does not run,
-// keep the test output as evidence and restore or dispose of the sacrificial
-// VM; do not use wildcard deletion and never act on the production key name.
+// Identity: the SubjectPublicKeyInfo of every created key is recorded from the
+// signer Create returns, and every delete uses that recorded value, never one
+// read by opening the key. If a create fails with an uncertain rollback
+// (windowscng.ErrCleanupFailed), or its SubjectPublicKeyInfo cannot be
+// recorded, the test fails naming the key and its uncertain state and deletes
+// nothing by name.
+//
+// Cleanup: t.Cleanup is registered before any CNG call; every signer is closed
+// before deletion, and Close and Delete errors are reported. A Close error is
+// reported, not proof that the native handle was released, and a successful
+// recovery delete does not clear an earlier FAIL. A recovery delete that
+// returns ErrKeyNotFound is reported as an uncertain state, never as successful
+// cleanup. This is fixture cleanup, not product recovery. If the process is
+// killed and t.Cleanup does not run, keep the test output as evidence and
+// restore or dispose of the sacrificial VM; do not use wildcard deletion and
+// never act on the production key name.
 
 import (
+	"bytes"
 	"crypto"
 	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
@@ -65,6 +74,12 @@ const (
 
 	// testKeyPrefix is the only namespace the smoke tests may create or delete.
 	testKeyPrefix = "Keppin.Test.MachineIdentity."
+
+	// smokeServiceName and otherServiceName name test services for the key
+	// policy. The services do not need to exist; the elevated test process
+	// opens the keys as a member of Administrators.
+	smokeServiceName = "KeppinMachineIdentitySmoke"
+	otherServiceName = "KeppinMachineIdentitySmokeOther"
 
 	// tokenElevationClass is TOKEN_INFORMATION_CLASS TokenElevation.
 	tokenElevationClass = 20
@@ -158,69 +173,75 @@ func guardTestKeyName(t *testing.T, name string) {
 	}
 }
 
-// precheckUnused requires that name cannot be opened before creation. It does
-// not prove absence: see the package-level ownership note.
-func precheckUnused(t *testing.T, name string) {
+// servicePolicy builds the ServicePolicy of a test service name.
+func servicePolicy(t *testing.T, service string) windowscng.ServicePolicy {
 	t.Helper()
-	guardTestKeyName(t, name)
-	s, err := openKey(name)
-	if err == nil {
-		cerr := closeSigner(s)
-		t.Fatalf("pre-check opened an existing key %q (collision); not signing, changing or deleting it; close error: %v", name, cerr)
+	p, err := windowscng.NewServicePolicy(service)
+	if err != nil {
+		t.Fatalf("NewServicePolicy(%q): %v", service, err)
 	}
-	if !errors.Is(err, ErrKeyNotFound) {
-		t.Fatalf("pre-check of %q failed with an unclassified error, not creating: %v", name, err)
-	}
+	return p
 }
 
 // closeSigner closes a signer returned by the keystore helpers.
-func closeSigner(s crypto.Signer) error {
-	c, ok := s.(windowscng.Signer)
-	if !ok {
-		return errors.New("signer does not implement windowscng.Signer")
+func closeSigner(s windowscng.Signer) error {
+	if s == nil {
+		return errors.New("nil signer")
 	}
-	return c.Close()
+	return s.Close()
 }
 
 // sessionKey tracks a test key created by this run.
 type sessionKey struct {
 	name    string
-	created bool // LoadOrCreate succeeded since the last confirmed delete
-	signers []crypto.Signer
+	policy  windowscng.ServicePolicy
+	spki    []byte // SubjectPublicKeyInfo recorded from the last successful Create
+	created bool   // Create succeeded since the last confirmed delete
+	signers []windowscng.Signer
 }
 
 // newSessionKey generates and guards a fresh name and registers the recovery
-// cleanup before any CNG call; the pre-check runs later, in create. Cleanup
-// closes every tracked signer and deletes the key only if it was created and
+// cleanup before any CNG call. Cleanup closes every tracked signer and deletes
+// the key with its recorded SubjectPublicKeyInfo only if it was created and
 // not already deleted by the test itself.
 func newSessionKey(t *testing.T) *sessionKey {
 	t.Helper()
-	k := &sessionKey{name: newTestKeyName(t)}
+	k := &sessionKey{name: newTestKeyName(t), policy: servicePolicy(t, smokeServiceName)}
 	t.Cleanup(func() { k.recover(t) })
 	return k
 }
 
-// create pre-checks and creates the key with the production profile.
-func (k *sessionKey) create(t *testing.T) crypto.Signer {
+// create creates the key with Create and records its SubjectPublicKeyInfo
+// from the returned signer.
+func (k *sessionKey) create(t *testing.T) windowscng.Signer {
 	t.Helper()
-	precheckUnused(t, k.name)
-	s, err := loadOrCreateKey(k.name)
+	guardTestKeyName(t, k.name)
+	s, err := createKey(k.name, k.policy)
 	if err != nil {
-		if errors.Is(err, windowscng.ErrCleanupFailed) {
-			t.Fatalf("loadOrCreateKey(%q): rollback failed, a residual key may persist (follow the recovery procedure): %v", k.name, err)
+		switch {
+		case errors.Is(err, windowscng.ErrCleanupFailed):
+			t.Fatalf("createKey(%q): rollback failed, the key may persist and its state is uncertain; nothing is deleted by name (follow the recovery procedure): %v", k.name, err)
+		case errors.Is(err, ErrKeyExists):
+			t.Fatalf("createKey(%q): a key already exists under the per-run name (collision); not signing, changing or deleting it: %v", k.name, err)
 		}
-		t.Fatalf("loadOrCreateKey(%q): %v", k.name, err)
+		t.Fatalf("createKey(%q): %v", k.name, err)
 	}
 	k.created = true
+	k.spki = nil
 	k.track(s)
+	spki, err := SPKI(s.Public())
+	if err != nil {
+		t.Fatalf("SPKI of the key created as %q: %v; no identity recorded, its state is uncertain and it is not deleted by name (follow the recovery procedure)", k.name, err)
+	}
+	k.spki = spki
 	return s
 }
 
-// open opens the existing key and tracks the signer.
-func (k *sessionKey) open(t *testing.T) crypto.Signer {
+// open opens the existing key under the session policy and tracks the signer.
+func (k *sessionKey) open(t *testing.T) windowscng.Signer {
 	t.Helper()
 	guardTestKeyName(t, k.name)
-	s, err := openKey(k.name)
+	s, err := openKey(k.name, k.policy)
 	if err != nil {
 		t.Fatalf("openKey(%q): %v", k.name, err)
 	}
@@ -228,7 +249,21 @@ func (k *sessionKey) open(t *testing.T) crypto.Signer {
 	return s
 }
 
-func (k *sessionKey) track(s crypto.Signer) { k.signers = append(k.signers, s) }
+// requireIntact reopens the key and checks that its SubjectPublicKeyInfo is
+// still the recorded one.
+func (k *sessionKey) requireIntact(t *testing.T) {
+	t.Helper()
+	s := k.open(t)
+	got, err := SPKI(s.Public())
+	if err != nil {
+		t.Fatalf("SPKI of reopened %q: %v", k.name, err)
+	}
+	if !bytes.Equal(got, k.spki) {
+		t.Fatalf("reopened %q has a different SubjectPublicKeyInfo than the recorded one", k.name)
+	}
+}
+
+func (k *sessionKey) track(s windowscng.Signer) { k.signers = append(k.signers, s) }
 
 // closeAll closes every tracked signer and reports each failure. Close is
 // idempotent, so signers already closed by the test report nil here.
@@ -245,21 +280,23 @@ func (k *sessionKey) closeAll(t *testing.T) bool {
 	return ok
 }
 
-// deleteAndConfirm closes all signers, deletes the exact key (must return nil)
-// and reads back that it no longer opens for this caller. ErrKeyNotFound on
-// the readback is the expected outcome; it is not proof of absence.
+// deleteAndConfirm closes all signers, deletes the exact key with its recorded
+// SubjectPublicKeyInfo (must return nil) and reads back that it no longer
+// opens for this caller. ErrKeyNotFound on the readback is the expected
+// outcome; it is not proof of absence. The recorded value is kept, so a
+// repeated delete of the same key can use it.
 func (k *sessionKey) deleteAndConfirm(t *testing.T) bool {
 	t.Helper()
 	guardTestKeyName(t, k.name)
 	if !k.closeAll(t) {
 		return false
 	}
-	if err := deleteKey(k.name); err != nil {
+	if err := deleteKey(k.name, k.policy, k.spki); err != nil {
 		t.Errorf("deleteKey(%q) = %v, want nil", k.name, err)
 		return false
 	}
 	k.created = false
-	s, err := openKey(k.name)
+	s, err := openKey(k.name, k.policy)
 	if err == nil {
 		cerr := closeSigner(s)
 		t.Errorf("openKey(%q) after delete succeeded: key still present (close error: %v)", k.name, cerr)
@@ -273,14 +310,20 @@ func (k *sessionKey) deleteAndConfirm(t *testing.T) bool {
 }
 
 // recover runs as t.Cleanup. A key already deleted by the test is not deleted
-// again; a key left behind by a failure is deleted and the outcome reported.
+// again; a key left behind by a failure is deleted with its recorded
+// SubjectPublicKeyInfo and the outcome reported. Without a recorded value
+// nothing is deleted.
 func (k *sessionKey) recover(t *testing.T) {
 	k.closeAll(t)
 	if !k.created {
 		return
 	}
 	guardTestKeyName(t, k.name)
-	err := deleteKey(k.name)
+	if len(k.spki) == 0 {
+		t.Errorf("recovery cleanup of %q: no recorded SubjectPublicKeyInfo, nothing deleted; key state uncertain, follow the recovery procedure", k.name)
+		return
+	}
+	err := deleteKey(k.name, k.policy, k.spki)
 	switch {
 	case err == nil:
 		k.created = false
@@ -289,6 +332,19 @@ func (k *sessionKey) recover(t *testing.T) {
 		t.Errorf("recovery cleanup of %q deleted nothing (not found or not accessible): key state uncertain, follow the recovery procedure: %v", k.name, err)
 	default:
 		t.Errorf("recovery cleanup of %q failed, a key may persist: %v", k.name, err)
+	}
+}
+
+// signAndVerify proves possession through the Machine Identity proof contract.
+func signAndVerify(t *testing.T, s crypto.Signer, pub crypto.PublicKey, label string) {
+	t.Helper()
+	challenge := []byte("keppin-machine-identity-smoke-challenge")
+	sig, err := identityproof.Sign(s, challenge)
+	if err != nil {
+		t.Fatalf("%s: identityproof.Sign: %v", label, err)
+	}
+	if err := identityproof.Verify(pub, challenge, sig); err != nil {
+		t.Fatalf("%s: identityproof.Verify: %v", label, err)
 	}
 }
 
@@ -303,27 +359,13 @@ func TestSmokeMachineIdentityKeyCustody(t *testing.T) {
 	if _, ok := signer.Public().(*ecdsa.PublicKey); !ok {
 		t.Fatalf("Public() = %T, want *ecdsa.PublicKey", signer.Public())
 	}
-
-	challenge := []byte("keppin-machine-identity-smoke-challenge")
-	sig, err := identityproof.Sign(signer, challenge)
-	if err != nil {
-		t.Fatalf("identityproof.Sign: %v", err)
-	}
-	if err := identityproof.Verify(signer.Public(), challenge, sig); err != nil {
-		t.Fatalf("identityproof.Verify: %v", err)
-	}
+	signAndVerify(t, signer, signer.Public(), "created")
 
 	opened := k.open(t)
 	if !pubEqual(signer.Public(), opened.Public()) {
-		t.Fatal("openKey returned a different persisted key than loadOrCreateKey")
+		t.Fatal("openKey returned a different persisted key than createKey")
 	}
-	sig2, err := identityproof.Sign(opened, challenge)
-	if err != nil {
-		t.Fatalf("identityproof.Sign (reopened): %v", err)
-	}
-	if err := identityproof.Verify(signer.Public(), challenge, sig2); err != nil {
-		t.Fatalf("identityproof.Verify (reopened): %v", err)
-	}
+	signAndVerify(t, opened, signer.Public(), "reopened")
 
 	if !k.deleteAndConfirm(t) {
 		t.FailNow()
@@ -332,23 +374,15 @@ func TestSmokeMachineIdentityKeyCustody(t *testing.T) {
 }
 
 // TestSmokeDeleteKeyLifecycle exercises the destructive lifecycle twice on the
-// same per-run test key name: pre-check, create, sign/verify, close, exact
-// delete, readback, repeated delete.
+// same per-run test key name: create, sign/verify, close, exact delete with the
+// recorded SubjectPublicKeyInfo, readback, repeated delete with the same value.
 func TestSmokeDeleteKeyLifecycle(t *testing.T) {
 	requireNativeSmoke(t)
 	k := newSessionKey(t)
 
 	for i := 1; i <= 2; i++ {
 		signer := k.create(t)
-
-		challenge := []byte("keppin-cleanup-lifecycle-challenge")
-		sig, err := identityproof.Sign(signer, challenge)
-		if err != nil {
-			t.Fatalf("iteration %d: sign: %v", i, err)
-		}
-		if err := identityproof.Verify(signer.Public(), challenge, sig); err != nil {
-			t.Fatalf("iteration %d: verify: %v", i, err)
-		}
+		signAndVerify(t, signer, signer.Public(), fmt.Sprintf("iteration %d", i))
 
 		// Close before delete (documented ownership contract).
 		if err := closeSigner(signer); err != nil {
@@ -359,13 +393,99 @@ func TestSmokeDeleteKeyLifecycle(t *testing.T) {
 			t.Fatalf("iteration %d: delete/readback failed", i)
 		}
 
-		// A repeated delete returns ErrKeyNotFound: this call deleted nothing.
-		// It is not an additional proof of cleanup.
-		if err := deleteKey(k.name); !errors.Is(err, ErrKeyNotFound) {
+		// A repeated delete with the SubjectPublicKeyInfo of this iteration
+		// returns ErrKeyNotFound: this call deleted nothing. It is not an
+		// additional proof of cleanup.
+		if err := deleteKey(k.name, k.policy, k.spki); !errors.Is(err, ErrKeyNotFound) {
 			t.Fatalf("iteration %d: second deleteKey = %v, want ErrKeyNotFound", i, err)
 		}
 	}
-	t.Log("scenarios run: 2x (pre-check, create, sign/verify, close, delete, readback, repeated delete)")
+	t.Log("scenarios run: 2x (create, sign/verify, close, delete, readback, repeated delete)")
+}
+
+// TestSmokeCreateExistingKeyNotAdopted proves a second Create on an existing
+// key returns ErrKeyExists without a signer and leaves the key intact.
+func TestSmokeCreateExistingKeyNotAdopted(t *testing.T) {
+	requireNativeSmoke(t)
+	k := newSessionKey(t)
+	k.create(t)
+
+	s, err := createKey(k.name, k.policy)
+	if err == nil {
+		k.track(s)
+		t.Fatalf("second createKey(%q) succeeded, want ErrKeyExists", k.name)
+	}
+	if s != nil {
+		t.Fatal("second createKey returned a signer with an error")
+	}
+	if !errors.Is(err, ErrKeyExists) {
+		t.Fatalf("second createKey(%q) = %v, want ErrKeyExists", k.name, err)
+	}
+	var ne *windowscng.NCryptError
+	if !errors.As(err, &ne) || ne.Code != windowscng.NTEExists {
+		t.Fatalf("second createKey(%q): native status NTE_EXISTS not reachable: %v", k.name, err)
+	}
+	k.requireIntact(t)
+
+	if !k.deleteAndConfirm(t) {
+		t.FailNow()
+	}
+	t.Log("scenarios run: create, second create refused (ErrKeyExists), key intact, delete, readback")
+}
+
+// TestSmokeDeleteWrongSPKIRefused proves a delete with the SubjectPublicKeyInfo
+// of another valid P-256 key is refused and deletes nothing.
+func TestSmokeDeleteWrongSPKIRefused(t *testing.T) {
+	requireNativeSmoke(t)
+	k := newSessionKey(t)
+	k.create(t)
+
+	other, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrong, err := SPKI(other.Public())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(wrong, k.spki) {
+		t.Fatal("generated key has the same SubjectPublicKeyInfo as the test key")
+	}
+	if !k.closeAll(t) {
+		t.FailNow()
+	}
+	if err := deleteKey(k.name, k.policy, wrong); !errors.Is(err, ErrDeleteVerificationFailed) {
+		t.Fatalf("deleteKey(%q) with another key's SubjectPublicKeyInfo = %v, want ErrDeleteVerificationFailed", k.name, err)
+	}
+	k.requireIntact(t)
+
+	if !k.deleteAndConfirm(t) {
+		t.FailNow()
+	}
+	t.Log("scenarios run: create, delete with another P-256 SPKI refused, key intact, delete, readback")
+}
+
+// TestSmokeOpenOtherPolicyMismatch proves an open under another service's
+// policy returns ErrKeyPolicyMismatch and leaves the key intact.
+func TestSmokeOpenOtherPolicyMismatch(t *testing.T) {
+	requireNativeSmoke(t)
+	k := newSessionKey(t)
+	k.create(t)
+
+	s, err := openKey(k.name, servicePolicy(t, otherServiceName))
+	if err == nil {
+		k.track(s)
+		t.Fatalf("openKey(%q) under another service policy succeeded, want ErrKeyPolicyMismatch", k.name)
+	}
+	if !errors.Is(err, ErrKeyPolicyMismatch) {
+		t.Fatalf("openKey(%q) under another service policy = %v, want ErrKeyPolicyMismatch", k.name, err)
+	}
+	k.requireIntact(t)
+
+	if !k.deleteAndConfirm(t) {
+		t.FailNow()
+	}
+	t.Log("scenarios run: create, open under another policy refused, key intact, delete, readback")
 }
 
 func pubEqual(a, b crypto.PublicKey) bool {
@@ -377,5 +497,5 @@ func pubEqual(a, b crypto.PublicKey) bool {
 	if !ok {
 		return false
 	}
-	return ea.Curve == eb.Curve && ea.X.Cmp(eb.X) == 0 && ea.Y.Cmp(eb.Y) == 0
+	return ea.Equal(eb)
 }

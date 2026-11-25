@@ -12,8 +12,8 @@ import (
 	"github.com/keppin-oss/machine-identity/identity"
 )
 
-// TestDeleteTargetsExactKeyName locks the exact production key name that
-// Delete() removes. No wildcard/prefix deletion is permitted.
+// TestDeleteTargetsExactKeyName locks the exact production key name that Open,
+// Create and Delete operate on. No wildcard/prefix deletion is permitted.
 func TestDeleteTargetsExactKeyName(t *testing.T) {
 	if machineIdentityKeyName != "Keppin.Agent.MachineIdentity.v1" {
 		t.Errorf("machineIdentityKeyName = %q, want %q", machineIdentityKeyName, "Keppin.Agent.MachineIdentity.v1")

@@ -114,6 +114,47 @@ func TestUsesSharedWindowscngPackage(t *testing.T) {
 	}
 }
 
+// TestNoLoadOrCreateInModuleSource keeps the removed load-or-create entry
+// point out of the module: no non-test Go file of the module, examples
+// included, may contain the term in any letter case, in code or in comments.
+// Opening and creating are separate operations; a failed open must never lead
+// to a create. Test files and historical release notes are not scanned: they
+// name the term on purpose.
+func TestNoLoadOrCreateInModuleSource(t *testing.T) {
+	const forbidden = "loadorcreate"
+	scanned := 0
+	err := filepath.WalkDir("..", func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			name := d.Name()
+			if path != ".." && (strings.HasPrefix(name, ".") || name == "graphify-out" || name == "testdata") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		scanned++
+		if strings.Contains(strings.ToLower(string(data)), forbidden) {
+			t.Errorf("%s contains the removed load-or-create term", filepath.ToSlash(path))
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if scanned == 0 {
+		t.Fatal("no module Go source files scanned")
+	}
+}
+
 // TestNoLocalOrEnterpriseTLSIdentity proves no Local-TLS or Enterprise-TLS
 // identity or policy is introduced in the Machine Identity keystore.
 func TestNoLocalOrEnterpriseTLSIdentity(t *testing.T) {
