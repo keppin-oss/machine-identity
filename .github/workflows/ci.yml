@@ -1,0 +1,83 @@
+name: ci
+
+# Default (synthetic) test suite. It creates no machine keys and does not
+# depend on the token elevation of the runner. The native keystore smoke tests
+# (build tag keystore_smoke) create real machine-scoped CNG keys: CI only vets
+# them and builds their test binary, it never runs them. Native validation is
+# done separately.
+#
+# The jobs run only in repositories owned by keppin-oss. In a copy owned by
+# anyone else they are skipped.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    if: github.repository_owner == 'keppin-oss'
+    runs-on: windows-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: go version
+        run: go version
+      - name: build
+        run: go build ./...
+      - name: vet (amd64)
+        run: go vet ./...
+      - name: vet (386)
+        run: GOARCH=386 go vet ./...
+      - name: vet native smoke tag (not run)
+        run: go vet -tags keystore_smoke ./...
+      - name: build native smoke test binary (not run)
+        run: go test -c -tags keystore_smoke -o "$RUNNER_TEMP/keystore_smoke.test.exe" ./keystore
+      - name: test
+        # Verbose, so the log names each test as PASS or SKIP.
+        run: go test ./... -count=1 -v
+
+  linux:
+    if: github.repository_owner == 'keppin-oss'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: go version
+        run: go version
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "gofmt reports:"
+            echo "$unformatted"
+            exit 1
+          fi
+      - name: build
+        run: go build ./...
+      - name: vet
+        run: go vet ./...
+      - name: test
+        run: go test ./... -count=1
